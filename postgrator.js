@@ -13,7 +13,8 @@ const {
 
 const DEFAULT_CONFIG = {
   schemaTable: 'schemaversion',
-  validateChecksums: true
+  validateChecksums: true,
+  nonSequential: false
 }
 
 class Postgrator extends EventEmitter {
@@ -154,6 +155,7 @@ class Postgrator extends EventEmitter {
    * @param {Number} databaseVersion
    */
   validateMigrations(databaseVersion) {
+    const { config } = this
     return this.getMigrations().then(migrations => {
       const validateMigrations = migrations.filter(
         migration =>
@@ -172,7 +174,8 @@ class Postgrator extends EventEmitter {
           })
           .then(results => {
             const md5 = results.rows && results.rows[0] && results.rows[0].md5
-            if (md5 !== migration.md5) {
+            if (!md5 && !config.nonSequential
+                || md5 !== migration.md5 && !config.nonSequential) {
               const msg = `MD5 checksum failed for migration [${
                 migration.version
               }]`
@@ -211,6 +214,64 @@ class Postgrator extends EventEmitter {
       throw error
     })
   }
+
+  /**
+   * returns an array of relevant do migrations based on the target and database version passed.
+   * returned array is sorted in the order it needs to be run
+   *
+   * @returns {Promise} - Array of relevant migration objects
+   * @param {Number} databaseVersion
+   * @param {Number} targetVersion
+   */
+  getNonSequentialRunnableDoMigrations(databaseVersion, targetVersion) {
+    const { migrations, commonClient } = this
+    let sequence = Promise.resolve()
+    const runnableMigrations = []
+    const doMigrations = migrations
+        .filter(
+            migration =>
+                migration.action === 'do'
+        )
+        .sort(sortMigrationsAsc);
+    doMigrations.forEach(migration => {
+      sequence = sequence
+        .then(() => commonClient.queries.versionInstalled(migration.version))
+        .then(sql => commonClient.runQuery(sql))
+        .then(result => {
+          const versionInstalled = result.rows.length > 0 ? result.rows[0].installed : 0
+          if (!versionInstalled) runnableMigrations.push(migration)
+        })
+    })
+    return sequence.then(() => runnableMigrations).catch(error => {
+      error.runnableMigrations = runnableMigrations
+      throw error
+    })  }
+
+  /**
+   * returns an array of relevant migrations based on the target and database version passed.
+   * returned array is sorted in the order it needs to be run
+   *
+   * @returns {Promise} - Array of relevant migration objects
+   * @param {Number} databaseVersion
+   * @param {Number} targetVersion
+   */
+  getNonSequentialRunnableMigrations(databaseVersion, targetVersion) {
+    const { migrations, commonClient } = this
+    let sequence = Promise.resolve()
+    const runnableMigrations = []
+    migrations.forEach(migration => {
+      sequence = sequence
+        .then(() => commonClient.queries.versionInstalled(migration.version))
+        .then(sql => commonClient.runQuery(sql))
+        .then(result => {
+          const versionInstalled = result.rows.length > 0 ? result.rows[0].installed : 0
+          if (!versionInstalled) runnableMigrations.push(migration)
+        })
+    })
+    return sequence.then(() => runnableMigrations).catch(error => {
+      error.runnableMigrations = runnableMigrations
+      throw error
+    })  }
 
   /**
    * returns an array of relevant migrations based on the target and database version passed.
@@ -278,9 +339,13 @@ class Postgrator extends EventEmitter {
           return this.validateMigrations(databaseVersion)
         }
       })
-      .then(() =>
-        this.getRunnableMigrations(data.databaseVersion, data.targetVersion)
-      )
+      .then(() => {
+        if (config.nonSequential) {
+          return this.getNonSequentialRunnableDoMigrations(data.databaseVersion, data.targetVersion)
+        } else {
+          return this.getRunnableMigrations(data.databaseVersion,data.targetVersion)
+        }
+      })
       .then(runnableMigrations => this.runMigrations(runnableMigrations))
       .then(migrations => commonClient.endConnection().then(() => migrations))
       .catch(error => {
